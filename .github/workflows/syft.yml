@@ -1,0 +1,347 @@
+name: OSS Compliance - Docker, Git or Uploaded Source with tags
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Scan a Docker image, Git repo, uploaded source.zip or image.tar archive'
+        required: true
+        default: 'docker'
+        type: choice
+        options: [docker, git, upload-zip, upload-tar]
+
+      docker_image:
+        description: 'Docker image name (e.g., nginx:latest) [scan_type: docker]'
+        required: false
+
+      git_url:
+        description: 'Git repository URL (e.g., https://github.com/user/repo OR https://github.com/user/repo/tree/v1.2.3)'
+        required: false
+
+      git_ref:   # NEW
+        description: 'Branch / tag / commit to scan [scan_type: git]. Leave blank if included in git_url (tree/commit/tag).'
+        required: false
+        default: ''
+
+      enable_syft:
+        description: 'Run Syft SBOM?'
+        required: false
+        default: 'true'
+        type: boolean
+
+      enable_grype:
+        description: 'Run Grype vulnerability scan?'
+        required: false
+        default: 'true'
+        type: boolean
+
+      enable_scanoss:
+        description: 'Run SCANOSS OSS scan?'
+        required: false
+        default: 'true'
+        type: boolean
+
+jobs:
+  oss-compliance:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ----------------------------------------------------
+      # Checkout & tooling
+      # ----------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install SCANOSS, Syft, Grype, and Excel deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --user scanoss pandas openpyxl
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh  | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      # ----------------------------------------------------
+      # Prepare source
+      # ----------------------------------------------------
+      - name: Pull Docker image
+        if: ${{ github.event.inputs.scan_type == 'docker' }}
+        run: docker pull "${{ github.event.inputs.docker_image }}"
+
+      - name: Save & extract Docker image filesystem
+        if: ${{ github.event.inputs.scan_type == 'docker' }}
+        run: |
+          mkdir -p docker-output/extracted-rootfs
+          docker save "${{ github.event.inputs.docker_image }}" -o docker-output/image.tar
+          tar -xf docker-output/image.tar -C docker-output
+          find docker-output -name 'layer.tar' -exec tar -xf {} -C docker-output/extracted-rootfs \;
+
+      - name: Clone Git repository
+        if: ${{ github.event.inputs.scan_type == 'git' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW_URL="${{ github.event.inputs.git_url }}"
+          RAW_REF="${{ github.event.inputs.git_ref }}"
+
+          if [[ -z "${RAW_URL}" ]]; then
+            echo "❌ git_url is required when scan_type=git" >&2
+            exit 1
+          fi
+
+          # Normalize URL and extract ref if user pasted a web URL
+          BASE_URL=""
+          DET_REF=""
+
+          case "$RAW_URL" in
+            https://github.com/*/tree/*)
+              DET_REF="${RAW_URL##*/tree/}"
+              BASE_URL="${RAW_URL%%/tree/*}.git"
+              ;;
+            https://github.com/*/commit/*)
+              DET_REF="${RAW_URL##*/commit/}"
+              BASE_URL="${RAW_URL%%/commit/*}.git"
+              ;;
+            https://github.com/*/releases/tag/*)
+              DET_REF="${RAW_URL##*/releases/tag/}"
+              BASE_URL="${RAW_URL%%/releases/tag/*}.git"
+              ;;
+            https://github.com/*/*)
+              BASE_URL="${RAW_URL%.git}.git"
+              ;;
+            *)
+              BASE_URL="${RAW_URL}"
+              ;;
+          esac
+
+          # Clean up refs/heads|refs/tags if pasted
+          GIT_REF="${RAW_REF#refs/heads/}"
+          GIT_REF="${GIT_REF#refs/tags/}"
+
+          # Choose ref: explicit > detected > main
+          if [[ -z "${GIT_REF}" ]]; then
+            if [[ -n "${DET_REF}" ]]; then
+              GIT_REF="${DET_REF}"
+            else
+              GIT_REF="main"
+            fi
+          fi
+
+          echo "🔧 Repo: ${BASE_URL}"
+          echo "🔧 Ref:  ${GIT_REF}"
+
+          rm -rf repo-to-scan
+
+          echo "🔎 Checking if '${GIT_REF}' is a branch/tag..."
+          if git ls-remote --tags --heads "${BASE_URL}" | grep -qE "refs/(heads|tags)/${GIT_REF}$"; then
+            echo "✅ Branch/tag found. Shallow cloning..."
+            git clone --depth 1 --branch "${GIT_REF}" "${BASE_URL}" repo-to-scan || true
+          fi
+
+          if [[ ! -d repo-to-scan ]]; then
+            echo "ℹ️  Not a branch/tag (or shallow clone failed). Full clone + checkout..."
+            git clone "${BASE_URL}" repo-to-scan
+            cd repo-to-scan
+            git fetch --all --tags --prune
+            if ! git checkout --detach "${GIT_REF}"; then
+              echo "❌ Ref '${GIT_REF}' not found in ${BASE_URL}" >&2
+              echo "   Tip: use a branch (e.g., main), a tag (e.g., v1.2.3), or a commit SHA."
+              exit 1
+            fi
+            cd -
+          fi
+
+          echo "✔ Checked out commit: $(cd repo-to-scan && git rev-parse HEAD)"
+
+      - name: Unzip uploaded source archive
+        if: ${{ github.event.inputs.scan_type == 'upload-zip' }}
+        run: |
+          mkdir -p uploaded-source
+          unzip input/*.zip -d uploaded-source
+
+      - name: Extract uploaded TAR archive
+        if: ${{ github.event.inputs.scan_type == 'upload-tar' }}
+        run: |
+          mkdir -p uploaded-tar
+          tar -xf input/*.tar -C uploaded-tar
+
+      # ----------------------------------------------------
+      # Auto-detect Dockerfile & optional image build
+      # (skip if scan_type == docker because the image already exists)
+      # ----------------------------------------------------
+      - name: Detect Dockerfile and optionally build image
+        id: autodock
+        if: ${{ github.event.inputs.scan_type != 'docker' }}
+        run: |
+          set -e
+          # Resolve scan directory
+          SCAN_DIR="."
+          if [[ "${{ github.event.inputs.scan_type }}" == "git"        ]]; then SCAN_DIR="repo-to-scan"; fi
+          if [[ "${{ github.event.inputs.scan_type }}" == "upload-zip" ]]; then SCAN_DIR="uploaded-source"; fi
+          if [[ "${{ github.event.inputs.scan_type }}" == "upload-tar" ]]; then SCAN_DIR="uploaded-tar"; fi
+
+          HAS_IMAGE=false
+          IMAGE_REF=""
+
+          # Locate first Dockerfile (any depth)
+          DF_PATH=$(find "$SCAN_DIR" -type f -iname 'Dockerfile' | head -n 1 || true)
+
+          if [[ -n "$DF_PATH" ]]; then
+            echo "Dockerfile found at $DF_PATH – attempting image build"
+            # Try to build; if it fails, we continue the workflow gracefully
+            if docker build -t auto-scanned-image:latest "$(dirname "$DF_PATH")"; then
+              HAS_IMAGE=true
+              IMAGE_REF="auto-scanned-image:latest"
+              echo "✅ Docker image built successfully"
+            else
+              echo "⚠️  Docker build failed – skipping image-based scan"
+            fi
+          else
+            echo "No Dockerfile found – skipping image build"
+          fi
+
+          # Pass state to later steps
+          echo "has_image=$HAS_IMAGE"  >> "$GITHUB_OUTPUT"
+          echo "image_ref=$IMAGE_REF"  >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------
+      # Set dynamic IMAGE_NAME env (handles docker/git & uploads)
+      # ----------------------------------------------------
+      - name: Set IMAGE_NAME env
+        run: |
+          if [[ "${{ github.event.inputs.scan_type }}" == "upload-tar" ]]; then
+            FILE=$(basename input/*.tar)
+            IMAGE_NAME="${FILE%.*}"        # alpine.tar → alpine
+          elif [[ "${{ github.event.inputs.scan_type }}" == "upload-zip" ]]; then
+            FILE=$(basename input/*.zip)
+            IMAGE_NAME="${FILE%.*}"        # source.zip → source
+          elif [[ "${{ github.event.inputs.scan_type }}" == "docker" ]]; then
+            IMAGE_NAME="${{ github.event.inputs.docker_image }}"
+          elif [[ "${{ github.event.inputs.scan_type }}" == "git" ]]; then
+            IMAGE_NAME="$(basename '${{ github.event.inputs.git_url }}' .git)"
+          else
+            IMAGE_NAME="upload"
+          fi
+          IMAGE_NAME=${IMAGE_NAME//[:\/@]/_}   # sanitize : / @
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+
+      # ----------------------------------------------------
+      # SCANOSS
+      # ----------------------------------------------------
+      - name: Run SCANOSS scan (Docker)
+        if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type == 'docker' }}
+        continue-on-error: true
+        run: python3 -m scanoss.cli scan -o scanoss-results.json docker-output/extracted-rootfs
+
+      - name: Run SCANOSS scan (Uploaded Source ZIP)
+        if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type == 'upload-zip' }}
+        continue-on-error: true
+        run: python3 -m scanoss.cli scan -o scanoss-results.json uploaded-source
+
+      - name: Run SCANOSS scan (Uploaded TAR)
+        if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type == 'upload-tar' }}
+        continue-on-error: true
+        run: python3 -m scanoss.cli scan -o scanoss-results.json uploaded-tar
+
+      - name: Run SCANOSS scan (Git)
+        if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type == 'git' }}
+        continue-on-error: true
+        run: python3 -m scanoss.cli scan -o scanoss-results.json repo-to-scan
+
+      # ----------------------------------------------------
+      # Syft
+      # ----------------------------------------------------
+      ## Docker image path (direct or auto-built)
+      - name: Run Syft on image (auto or docker)
+        if: |
+          github.event.inputs.enable_syft == 'true' &&
+          (
+            github.event.inputs.scan_type == 'docker' ||
+            (github.event.inputs.scan_type != 'docker' && steps.autodock.outputs.has_image == 'true')
+          )
+        continue-on-error: true
+        run: |
+          IMG_REF="${{ github.event.inputs.docker_image }}"
+          if [[ -z "$IMG_REF" ]]; then
+            IMG_REF="${{ steps.autodock.outputs.image_ref }}"
+          fi
+          syft "$IMG_REF" -o spdx-json > syft-sbom.spdx.json
+
+      ## Directory scan fallback
+      - name: Run Syft on directory (source)
+        if: |
+          github.event.inputs.enable_syft == 'true' &&
+          (
+            (github.event.inputs.scan_type == 'git'        && steps.autodock.outputs.has_image == 'false') ||
+            (github.event.inputs.scan_type == 'upload-zip' && steps.autodock.outputs.has_image == 'false') ||
+            (github.event.inputs.scan_type == 'upload-tar' && steps.autodock.outputs.has_image == 'false')
+          )
+        continue-on-error: true
+        run: |
+          TARGET_DIR=""
+          if [[ "${{ github.event.inputs.scan_type }}" == "git" ]]; then TARGET_DIR="repo-to-scan"; fi
+          if [[ "${{ github.event.inputs.scan_type }}" == "upload-zip" ]]; then TARGET_DIR="uploaded-source"; fi
+          if [[ "${{ github.event.inputs.scan_type }}" == "upload-tar" ]]; then TARGET_DIR="uploaded-tar"; fi
+          syft dir:$TARGET_DIR -o spdx-json > syft-sbom.spdx.json
+
+      # ----------------------------------------------------
+      # Grype
+      # ----------------------------------------------------
+      ## Image scan
+      - name: Run Grype on image (auto or docker)
+        if: |
+          github.event.inputs.enable_grype == 'true' &&
+          (
+            github.event.inputs.scan_type == 'docker' ||
+            (github.event.inputs.scan_type != 'docker' && steps.autodock.outputs.has_image == 'true')
+          )
+        continue-on-error: true
+        run: |
+          IMG_REF="${{ github.event.inputs.docker_image }}"
+          if [[ -z "$IMG_REF" ]]; then
+            IMG_REF="${{ steps.autodock.outputs.image_ref }}"
+          fi
+          grype "$IMG_REF" -o json > grype-scan.json
+
+      ## Directory scan fallback
+      - name: Run Grype on directory (source)
+        if: |
+          github.event.inputs.enable_grype == 'true' &&
+          (
+            (github.event.inputs.scan_type == 'git' && steps.autodock.outputs.has_image == 'false') ||
+            (github.event.inputs.scan_type == 'upload-zip' && steps.autodock.outputs.has_image == 'false') ||
+            (github.event.inputs.scan_type == 'upload-tar' && steps.autodock.outputs.has_image == 'false')
+          )
+        continue-on-error: true
+        run: |
+          TARGET_DIR=""
+          if [[ "${{ github.event.inputs.scan_type }}" == "git" ]]; then TARGET_DIR="repo-to-scan"; fi
+          if [[ "${{ github.event.inputs.scan_type }}" == "upload-zip" ]]; then TARGET_DIR="uploaded-source"; fi
+          if [[ "${{ github.event.inputs.scan_type }}" == "upload-tar" ]]; then TARGET_DIR="uploaded-tar"; fi
+          grype dir:$TARGET_DIR -o json > grype-scan.json
+
+      # ----------------------------------------------------
+      # Merge & upload
+      # ----------------------------------------------------
+      - name: Merge outputs and generate Excel report
+        run: python3 generate_excel_merge_syft_grype_scanoss.py
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+
+      - name: Upload Compliance Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oss-scan-results-${{ env.IMAGE_NAME }}
+          path: |
+            *_compliance_merged_report.xlsx
+            *_scanoss_components_report.xlsx
+            *_grype_components_report.xlsx
+            *_syft_components_report.xlsx
+            grype-scan.json
+            syft-sbom.spdx.json
+            scanoss-results.json

@@ -1,0 +1,480 @@
+name: "ScanCode Toolkit Scan (downloadable in ui)"
+
+run-name: >-
+  ScanCode ${{ github.event.inputs.scan_mode }} •
+  ${{ github.event.inputs.source }} •
+  ${{ github.event.inputs.client_run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_mode:
+        description: "What to scan"
+        required: true
+        type: choice
+        options: [repo, folder, zip, tar, docker]
+        default: repo
+
+      source:
+        description: >-
+          Repo URL (repo/folder) | Archive URL or workspace path (.zip/.tar/.tar.gz/.tar.xz) (zip/tar)
+          | Docker image (docker)
+        required: true
+        default: "https://github.com/psf/requests.git"
+
+      git_ref:
+        description: "Branch / tag / commit (optional; for repo/folder). If omitted, /tree/<ref> or /releases/tag/<tag> in URL wins; else 'main'."
+        required: false
+        default: ""
+
+      folder_path:
+        description: "Subfolder inside the repo to scan (only if scan_mode=folder)"
+        required: false
+        default: ""
+
+      client_run_id:
+        description: "Opaque run tag from the UI (for status + artifact lookup)"
+        required: false
+        default: ""
+
+      enable_license_scan:
+        type: boolean
+        description: "Run license + license-text detection"
+        default: true
+
+      enable_copyright_scan:
+        type: boolean
+        description: "Run copyright + author + email detection"
+        default: true
+
+      enable_package:
+        type: boolean
+        description: "Detect packages and manifests"
+        default: true
+
+      enable_sbom_export:
+        type: boolean
+        description: "Export SPDX and CycloneDX SBOM"
+        default: false
+
+jobs:
+  scancode:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # xz-utils enables tar -J (for .tar.xz/.txz)
+          sudo apt-get install -y git unzip jq tar curl xz-utils python3 python3-pip
+          pip3 install --no-input pandas openpyxl
+
+      - name: Prepare input
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SCAN_MODE="${{ github.event.inputs.scan_mode }}"
+          SOURCE_RAW="${{ github.event.inputs.source }}"
+          GIT_REF_RAW="${{ github.event.inputs.git_ref }}"
+          FOLDER_PATH="${{ github.event.inputs.folder_path }}"
+          RUN_TAG_IN="${{ github.event.inputs.client_run_id }}"
+
+          # Fall back to the current GITHUB_RUN_ID if UI didn't pass a tag
+          if [ -z "${RUN_TAG_IN}" ]; then RUN_TAG_IN="${GITHUB_RUN_ID}"; fi
+
+          normalize_repo_url() {
+            local raw="$1"
+            local base_url=""
+            local det_ref=""
+            case "$raw" in
+              https://github.com/*/tree/*)
+                det_ref="${raw##*/tree/}"; det_ref="${det_ref%%/*}"
+                base_url="${raw%%/tree/*}.git"
+                ;;
+              https://github.com/*/commit/*)
+                det_ref="${raw##*/commit/}"; det_ref="${det_ref%%/*}"
+                base_url="${raw%%/commit/*}.git"
+                ;;
+              https://github.com/*/releases/tag/*)
+                det_ref="${raw##*/releases/tag/}"; det_ref="${det_ref%%/*}"
+                base_url="${raw%%/releases/tag/*}.git"
+                ;;
+              https://github.com/*/*)
+                base_url="${raw%.git}.git"
+                ;;
+              *)
+                base_url="$raw"
+                ;;
+            esac
+            echo "$base_url|$det_ref"
+          }
+
+          strip_ref() {
+            local r="$1"
+            r="${r#refs/heads/}"; r="${r#refs/tags/}"
+            echo "$r"
+          }
+
+          is_url() {
+            case "$1" in
+              http://*|https://*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          case "$SCAN_MODE" in
+            repo)
+              if [[ -z "$SOURCE_RAW" ]]; then
+                echo "❌ source is required for scan_mode=repo (repo URL)" >&2
+                exit 1
+              fi
+
+              norm="$(normalize_repo_url "$SOURCE_RAW")"
+              BASE_URL="${norm%%|*}"
+              DET_REF="${norm##*|}"
+
+              GIT_REF="$(strip_ref "$GIT_REF_RAW")"
+              if [[ -z "$GIT_REF" ]]; then
+                if [[ -n "$DET_REF" ]]; then GIT_REF="$DET_REF"; else GIT_REF="main"; fi
+              fi
+
+              echo "🔧 Repo URL (normalized): ${BASE_URL}"
+              echo "🔧 Ref: ${GIT_REF}"
+
+              rm -rf "input_repo"
+              echo "🔎 Checking if '${GIT_REF}' is a branch or tag…"
+              if git ls-remote --tags --heads "${BASE_URL}" | grep -Fq "refs/heads/${GIT_REF}" || \
+                 git ls-remote --tags --heads "${BASE_URL}" | grep -Fq "refs/tags/${GIT_REF}"; then
+                echo "✅ Found branch/tag. Shallow cloning…"
+                git clone --depth 1 --branch "${GIT_REF}" "${BASE_URL}" "input_repo" || true
+              fi
+
+              if [[ ! -d "input_repo" ]]; then
+                echo "ℹ️ Not a branch/tag (or shallow clone failed). Full clone + checkout…"
+                git clone "${BASE_URL}" "input_repo"
+                cd "input_repo"
+                git fetch --all --tags --prune
+                if ! git checkout --detach "${GIT_REF}"; then
+                  echo "❌ Ref '${GIT_REF}' not found in ${BASE_URL}" >&2
+                  exit 1
+                fi
+                cd -
+              fi
+
+              INPUT_PATH="input_repo"
+              LABEL="$(basename "${BASE_URL%.*}")"
+              ;;
+
+            folder)
+              if [[ -z "$SOURCE_RAW" ]]; then
+                echo "❌ source is required for scan_mode=folder (repo URL)" >&2
+                exit 1
+              fi
+              if [[ -z "$FOLDER_PATH" ]]; then
+                echo "❌ folder_path is required for scan_mode=folder" >&2
+                exit 1
+              fi
+
+              norm="$(normalize_repo_url "$SOURCE_RAW")"
+              BASE_URL="${norm%%|*}"
+              DET_REF="${norm##*|}"
+
+              GIT_REF="$(strip_ref "$GIT_REF_RAW")"
+              if [[ -z "$GIT_REF" ]]; then
+                if [[ -n "$DET_REF" ]]; then GIT_REF="$DET_REF"; else GIT_REF="main"; fi
+              fi
+
+              echo "🔧 Repo URL (normalized): ${BASE_URL}"
+              echo "🔧 Ref: ${GIT_REF}"
+
+              rm -rf "input_repo"
+              echo "🔎 Checking if '${GIT_REF}' is a branch or tag…"
+              if git ls-remote --tags --heads "${BASE_URL}" | grep -Fq "refs/heads/${GIT_REF}" || \
+                 git ls-remote --tags --heads "${BASE_URL}" | grep -Fq "refs/tags/${GIT_REF}"; then
+                echo "✅ Found branch/tag. Shallow cloning…"
+                git clone --depth 1 --branch "${GIT_REF}" "${BASE_URL}" "input_repo" || true
+              fi
+
+              if [[ ! -d "input_repo" ]]; then
+                echo "ℹ️ Not a branch/tag (or shallow clone failed). Full clone + checkout…"
+                git clone "${BASE_URL}" "input_repo"
+                cd "input_repo"
+                git fetch --all --tags --prune
+                if ! git checkout --detach "${GIT_REF}"; then
+                  echo "❌ Ref '${GIT_REF}' not found in ${BASE_URL}" >&2
+                  exit 1
+                fi
+                cd -
+              fi
+
+              # Resolve folder safely within repo
+              REPO_ROOT="$(cd "input_repo" && pwd)"
+              TARGET_PATH="$(cd "input_repo/$FOLDER_PATH" 2>/dev/null && pwd || true)"
+              if [[ -z "$TARGET_PATH" || "${TARGET_PATH}" != "${REPO_ROOT}"/* ]]; then
+                echo "❌ folder_path resolves outside repo or doesn't exist: $FOLDER_PATH" >&2
+                exit 1
+              fi
+              INPUT_PATH="$TARGET_PATH"
+              LABEL="$(basename "${BASE_URL%.*}")__$(echo "$FOLDER_PATH" | tr '/:' '__')"
+              ;;
+
+            zip)
+              if is_url "$SOURCE_RAW"; then
+                echo "📥 Downloading ZIP from $SOURCE_RAW …"
+                curl -L --fail --retry 3 --retry-delay 2 "$SOURCE_RAW" -o "input.zip"
+                unzip -q "input.zip" -d "input_zip"
+                INPUT_PATH="input_zip"
+                base="$(basename "${SOURCE_RAW%%\?*}")"; LABEL="${base%.zip}"
+              else
+                if [[ ! -f "$SOURCE_RAW" ]]; then
+                  echo "❌ source not found in workspace: $SOURCE_RAW" >&2
+                  exit 1
+                fi
+                unzip -q "$SOURCE_RAW" -d "input_zip"
+                INPUT_PATH="input_zip"
+                base="$(basename "$SOURCE_RAW")"; LABEL="${base%.*}"
+              fi
+              ;;
+
+            tar)
+              if is_url "$SOURCE_RAW"; then
+                echo "📥 Downloading TAR from $SOURCE_RAW …"
+                curl -L --fail --retry 3 --retry-delay 2 "$SOURCE_RAW" -o "input.tar"
+              else
+                if [[ ! -f "$SOURCE_RAW" ]]; then
+                  echo "❌ source not found in workspace: $SOURCE_RAW" >&2
+                  exit 1
+                fi
+                cp "$SOURCE_RAW" "input.tar"
+              fi
+
+              mkdir -p "input_tar"
+
+              # Handle .tar.gz/.tgz, .tar.xz/.txz, and plain .tar
+              if [[ "$SOURCE_RAW" == *.tar.gz || "$SOURCE_RAW" == *.tgz ]]; then
+                tar -xzf "input.tar" -C "input_tar"
+              elif [[ "$SOURCE_RAW" == *.tar.xz || "$SOURCE_RAW" == *.txz ]]; then
+                tar -xJf "input.tar" -C "input_tar"
+              else
+                tar -xf "input.tar" -C "input_tar"
+              fi
+
+              base="$(basename "${SOURCE_RAW%%\?*}")"
+              case "$base" in
+                *.tar.gz) base="${base%.tar.gz}" ;;
+                *.tgz)    base="${base%.tgz}" ;;
+                *.tar.xz) base="${base%.tar.xz}" ;;
+                *.txz)    base="${base%.txz}" ;;
+                *.tar)    base="${base%.tar}" ;;
+              esac
+              LABEL="$base"
+              INPUT_PATH="input_tar"
+              ;;
+
+            docker)
+              DOCKER_IMAGE="$SOURCE_RAW"
+              if [[ -z "$DOCKER_IMAGE" ]]; then
+                echo "❌ source (docker image) is required for scan_mode=docker" >&2
+                exit 1
+              fi
+              echo "📥 Pulling Docker image: $DOCKER_IMAGE"
+              docker pull "$DOCKER_IMAGE"
+              echo "DOCKER_IMAGE_REF=$DOCKER_IMAGE" >> "$GITHUB_ENV"
+              # LABEL from image ref
+              LABEL="$(echo "$DOCKER_IMAGE" | tr '/:@' '__')"
+              # INPUT_PATH will be set by the Docker rootfs export step
+              ;;
+
+            *)
+              echo "❌ Unknown scan_mode: $SCAN_MODE" >&2
+              exit 1
+              ;;
+          esac
+
+          # Sanitize label for filenames
+          RAW_LABEL="${LABEL:-scan}"
+          SAN_LABEL="$(echo "$RAW_LABEL" | tr -cd 'A-Za-z0-9._-')"
+          if [[ -z "$SAN_LABEL" ]]; then SAN_LABEL="scan"; fi
+          SAN_LABEL="${SAN_LABEL:0:80}"
+
+          # Persist
+          if [[ -n "${INPUT_PATH:-}" ]]; then
+            echo "INPUT_PATH=$INPUT_PATH" >> "$GITHUB_ENV"
+          fi
+          echo "SCAN_LABEL=$SAN_LABEL" >> "$GITHUB_ENV"
+          echo "RUN_TAG=$RUN_TAG_IN"   >> "$GITHUB_ENV"
+
+      - name: Prepare Docker rootfs for ScanCode (docker mode)
+        if: ${{ github.event.inputs.scan_mode == 'docker' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ github.event.inputs.source }}"
+          CID="$(docker create "$IMG" /bin/true)"
+          mkdir -p docker-rootfs
+          # export the container filesystem and unpack to directory
+          docker export "$CID" | tar -C docker-rootfs -xf -
+          docker rm "$CID" >/dev/null
+          # ensure world-readable to avoid permission issues
+          chmod -R a+rX docker-rootfs || true
+          echo "INPUT_PATH=docker-rootfs" >> "$GITHUB_ENV"
+
+      - name: Download ScanCode Toolkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/aboutcode-org/scancode-toolkit.git
+          cd scancode-toolkit
+          ./scancode --version
+
+      - name: Run ScanCode Toolkit (JSON/SBOM) + copyrights CSV
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd scancode-toolkit
+
+          SCANCODE_OPTS=""
+          if [ "${{ github.event.inputs.enable_license_scan }}" = "true" ]; then
+            SCANCODE_OPTS="$SCANCODE_OPTS --license --license-text"
+          fi
+          if [ "${{ github.event.inputs.enable_package }}" = "true" ]; then
+            SCANCODE_OPTS="$SCANCODE_OPTS --package"
+          fi
+
+          OUT_PREFIX="$GITHUB_WORKSPACE/scancode_${SCAN_LABEL}"
+          IN_PATH="$GITHUB_WORKSPACE/${INPUT_PATH}"
+
+          MAIN_JSON_OPTS="$SCANCODE_OPTS"
+          if [ "${{ github.event.inputs.enable_copyright_scan }}" = "true" ]; then
+            MAIN_JSON_OPTS="$MAIN_JSON_OPTS --copyright --email --info"
+          fi
+
+          # Main JSON
+          ./scancode $MAIN_JSON_OPTS --json-pp "${OUT_PREFIX}.json" "$IN_PATH"
+
+          # SBOM exports (CycloneDX JSON+XML, plus SPDX TV+RDF)
+          if [ "${{ github.event.inputs.enable_sbom_export }}" = "true" ]; then
+            ./scancode --cyclonedx     "${OUT_PREFIX}.cdx.json" "$IN_PATH"
+            ./scancode --cyclonedx-xml "${OUT_PREFIX}.cdx.xml"  "$IN_PATH"
+            ./scancode --spdx-tv       "${OUT_PREFIX}.spdx.tv"  "$IN_PATH"
+            ./scancode --spdx-rdf      "${OUT_PREFIX}.spdx.rdf" "$IN_PATH"
+          fi
+
+          # Copyrights CSV (produce when SBOM export or license scan is on)
+          if [ "${{ github.event.inputs.enable_sbom_export }}" = "true" ] || [ "${{ github.event.inputs.enable_license_scan }}" = "true" ]; then
+            ./scancode -c --csv "${OUT_PREFIX}_copyrights.csv" "$IN_PATH" || true
+          fi
+
+          echo "OUT_PREFIX=$OUT_PREFIX" >> "$GITHUB_ENV"
+
+      - name: Convert JSON → Excel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import os, json, pandas as pd
+          main_json = os.getenv("OUT_PREFIX", "") + ".json"
+          if not main_json or not os.path.exists(main_json):
+              print("No main JSON found, skipping Excel.")
+              raise SystemExit(0)
+
+          with open(main_json, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          lic_rows, file_rows, copy_rows, dep_rows = [], [], [], []
+
+          for lic in data.get("license_detections", []):
+              for ref in lic.get("reference_matches", []):
+                  lic_rows.append({
+                      "file_path": ref.get("from_file"),
+                      "license_expression": lic.get("license_expression"),
+                      "license_expression_spdx": lic.get("license_expression_spdx"),
+                      "start_line": ref.get("start_line"),
+                      "end_line": ref.get("end_line"),
+                      "score": ref.get("score"),
+                      "rule_url": ref.get("rule_url"),
+                      "matched_text": (ref.get("matched_text") or "")[:200],
+                  })
+
+          for fi in data.get("files", []):
+              file_rows.append({
+                  "path": fi.get("path"),
+                  "type": fi.get("type"),
+                  "licenses": "; ".join([l.get("spdx_license_key","") for l in fi.get("licenses", []) if l.get("spdx_license_key")]),
+                  "copyrights": "; ".join([c.get("value","") for c in fi.get("copyrights", []) if c.get("value")]),
+                  "authors": "; ".join([a.get("value","") for a in fi.get("authors", []) if a.get("value")]),
+                  "emails": "; ".join([e.get("value","") for e in fi.get("emails", []) if e.get("value")]),
+                  "urls": "; ".join([u.get("value","") for u in fi.get("urls", []) if u.get("value")]),
+              })
+              for c in fi.get("copyrights", []):
+                  if c.get("value"):
+                      copy_rows.append({"file": fi.get("path"), "copyright": c.get("value")})
+              for a in fi.get("authors", []):
+                  if a.get("value"):
+                      copy_rows.append({"file": fi.get("path"), "author": a.get("value")})
+              for e in fi.get("emails", []):
+                  if e.get("value"):
+                      copy_rows.append({"file": fi.get("path"), "email": e.get("value")})
+
+          for dep in data.get("dependencies", []):
+              dep_rows.append({
+                  "purl": dep.get("purl"),
+                  "requirement": dep.get("extracted_requirement"),
+                  "scope": dep.get("scope"),
+                  "is_runtime": dep.get("is_runtime"),
+                  "is_optional": dep.get("is_optional"),
+                  "is_direct": dep.get("is_direct"),
+                  "datafile": dep.get("datafile_path"),
+              })
+
+          df_lic   = pd.DataFrame(lic_rows)
+          df_files = pd.DataFrame(file_rows)
+          df_copy  = pd.DataFrame(copy_rows)
+          df_deps  = pd.DataFrame(dep_rows)
+
+          summary_blocks = []
+          if not df_lic.empty:
+              lic_summary = df_lic.groupby("license_expression_spdx", dropna=True)["file_path"].count().reset_index()
+              lic_summary.rename(columns={"file_path":"count"}, inplace=True)
+              lic_summary.insert(0,"Category","Licenses")
+              summary_blocks.append(lic_summary)
+          if not df_copy.empty:
+              s2 = df_copy.copy()
+              s2.insert(0,"Category","Copyrights/Authors/Emails")
+              summary_blocks.append(s2)
+          if not df_deps.empty:
+              s3 = df_deps[["purl","requirement","scope"]].copy()
+              s3.insert(0,"Category","Dependencies")
+              summary_blocks.append(s3)
+          df_summary = pd.concat(summary_blocks, ignore_index=True) if summary_blocks else pd.DataFrame()
+
+          scan_label = os.getenv("SCAN_LABEL", "scancode")
+          out_xlsx = f"scancode_{scan_label}.xlsx"
+          with pd.ExcelWriter(out_xlsx) as w:
+              if not df_lic.empty:   df_lic.to_excel(w, "Licenses_Detail",   index=False)
+              if not df_files.empty: df_files.to_excel(w, "Files_Detail",     index=False)
+              if not df_copy.empty:  df_copy.to_excel(w, "Copyrights_Detail", index=False)
+              if not df_deps.empty:  df_deps.to_excel(w, "Dependencies",      index=False)
+              if not df_summary.empty: df_summary.to_excel(w, "Summary",      index=False)
+          print(f"✅ Wrote Excel: {out_xlsx}")
+          EOF
+
+      - name: Upload ScanCode reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: scancode-reports-${{ env.SCAN_LABEL }}-${{ env.RUN_TAG }}
+          path: |
+            scancode_${{ env.SCAN_LABEL }}.json
+            scancode_${{ env.SCAN_LABEL }}.xlsx
+            scancode_${{ env.SCAN_LABEL }}.spdx.tv
+            scancode_${{ env.SCAN_LABEL }}.spdx.rdf
+            scancode_${{ env.SCAN_LABEL }}.cdx.json
+            scancode_${{ env.SCAN_LABEL }}.cdx.xml
+            scancode_${{ env.SCAN_LABEL }}_copyrights.csv
+          if-no-files-found: ignore
