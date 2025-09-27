@@ -1,2 +1,15 @@
-nicegui==2.*
+# Core UI framework
+nicegui>=1.4.20
+
+# GitHub API + HTTP requests
 requests>=2.31.0
+
+# Environment variable loader (for .env file with GITHUB_TOKEN)
+python-dotenv>=1.0.0
+
+# Excel + Data handling (used in your workflows)
+pandas>=2.2.0
+openpyxl>=3.1.2
+
+# For JSON handling & utilities (standard lib covers most, but keeping compatibility)
+pyyaml>=6.0.1
